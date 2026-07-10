@@ -22,14 +22,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r pipeline/requirements.txt
 
+      # Persist immutable month archives + address points between runs so the
+      # daily job only refetches the 2-3 most recent (still-changing) months
+      # instead of the full 12-month window.
+      - name: Restore DataSF fetch cache
+        uses: actions/cache@v4
+        with:
+          path: pipeline/cache
+          key: datasf-cache-${{ github.run_id }}
+          restore-keys: datasf-cache-
+
+      - name: Expire stale address cache (monthly refresh)
+        run: find pipeline/cache -name "addresses.jsonl.gz" -mtime +30 -delete 2>/dev/null || true
+
       - name: Run pipeline
         working-directory: pipeline
         env:
-          # Optional but recommended: create a free Socrata app token at
-          # https://data.sfgov.org/profile/edit/developer_settings and add it
-          # as a repo secret to avoid throttling.
+          # Optional: a free Socrata app token further raises rate limits.
           SODA_APP_TOKEN: ${{ secrets.SODA_APP_TOKEN }}
-        run: python run_pipeline.py --months 12 --no-cache
+        run: python run_pipeline.py --months 12
 
       - name: Publish to GitHub Pages branch
         uses: peaceiris/actions-gh-pages@v4
