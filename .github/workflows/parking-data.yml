@@ -1,0 +1,40 @@
+name: Refresh SF parking data
+
+on:
+  schedule:
+    # Daily at 10:15 UTC (2:15/3:15 AM Pacific), after DataSF's nightly update
+    - cron: "15 10 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r pipeline/requirements.txt
+
+      - name: Run pipeline
+        working-directory: pipeline
+        env:
+          # Optional but recommended: create a free Socrata app token at
+          # https://data.sfgov.org/profile/edit/developer_settings and add it
+          # as a repo secret to avoid throttling.
+          SODA_APP_TOKEN: ${{ secrets.SODA_APP_TOKEN }}
+        run: python run_pipeline.py --months 12 --no-cache
+
+      - name: Publish to GitHub Pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: pipeline/output
+          publish_branch: gh-pages
+          force_orphan: true
