@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Build the No Time to Speed parking-risk data bundle for San Francisco.
+
+Outputs (written to pipeline/output/):
+  risk_grid.json  - citation counts per ~100m grid cell x hour-of-week x category
+  sweeping.json   - street sweeping schedule blockfaces with geometry
+  meters.json     - metered blocks with operating hours
+  manifest.json   - version + freshness metadata
+
+Run:  python3 run_pipeline.py [--months 12] [--skip-fetch]
+"""
+
+import argparse
+import gzip
+import json
+import math
+import os
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+
+import categories
+import sf_open_data as soda
+from geocoder import Geocoder
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE = os.path.join(HERE, "cache")
+OUTPUT = os.path.join(HERE, "output")
+
+# Grid geometry - MUST stay in sync with ParkingRisk.swift on the iOS side.
+LAT_STEP = 0.001    # ~111 m
+LON_STEP = 0.00125  # ~110 m at SF latitude
+
+WEEKDAYS = {
+    "mon": 0, "monday": 0,
+    "tues": 1, "tue": 1, "tuesday": 1,
+    "wed": 2, "wednesday": 2,
+    "thu": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+
+def log(msg: str):
+    print(msg, flush=True)
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- citations
+
+def _month_starts(months: int, now: datetime) -> list[datetime]:
+    first = datetime(now.year, now.month, 1)
+    starts = [first]
+    for _ in range(months):
+        prev = starts[-1] - timedelta(days=1)
+        starts.append(datetime(prev.year, prev.month, 1))
+    return list(reversed(starts))
+
+
+def fetch_citations(months: int, now: datetime, use_cache: bool) -> list[dict]:
+    """Fetch citation rows month-by-month with a local cache for dev reruns."""
+    os.makedirs(CACHE, exist_ok=True)
+    fields = "citation_issued_datetime,violation,violation_desc,citation_location,fine_amount"
+    rows: list[dict] = []
+    starts = _month_starts(months, now)
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else now + timedelta(days=1)
+        tag = start.strftime("%Y%m")
+        cache_file = os.path.join(CACHE, f"citations_{tag}.jsonl.gz")
+        # Recent months keep changing (late-added citations); only trust cache
+        # for months that ended more than 45 days ago.
+        stable = (now - end).days > 45
+        if use_cache and stable and os.path.exists(cache_file):
+            with gzip.open(cache_file, "rt") as f:
+                month_rows = [json.loads(line) for line in f]
+        else:
+            where = (f"citation_issued_datetime >= '{start.isoformat()}' AND "
+                     f"citation_issued_datetime < '{end.isoformat()}'")
+            month_rows = list(soda.fetch_all(soda.CITATIONS, select=fields, where=where))
+            if stable:
+                with gzip.open(cache_file, "wt") as f:
+                    for r in month_rows:
+                        f.write(json.dumps(r) + "\n")
+        log(f"  {tag}: {len(month_rows):,} citations")
+        rows.extend(month_rows)
+    return rows
+
+
+def build_geocoder(use_cache: bool) -> Geocoder:
+    os.makedirs(CACHE, exist_ok=True)
+    cache_file = os.path.join(CACHE, "addresses.jsonl.gz")
+    gc = Geocoder()
+    if use_cache and os.path.exists(cache_file):
+        with gzip.open(cache_file, "rt") as f:
+            for line in f:
+                gc.add_address(json.loads(line))
+    else:
+        fields = "address_number,street_name,street_type,latitude,longitude"
+        with gzip.open(cache_file, "wt") as f:
+            for row in soda.fetch_all(soda.ADDRESSES, select=fields):
+                gc.add_address(row)
+                f.write(json.dumps(row) + "\n")
+    gc.finalize()
+    return gc
+
+
+def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) -> dict:
+    cells: dict[tuple[int, int], dict] = defaultdict(
+        lambda: {"t": 0, "c": Counter(), "h": Counter()})
+    geocoded = failed = 0
+    data_through = None
+
+    for row in rows:
+        try:
+            ts = datetime.fromisoformat(row["citation_issued_datetime"])
+        except (KeyError, ValueError):
+            continue
+        if ts > now + timedelta(days=1):  # bad future-dated rows exist upstream
+            continue
+        pt = gc.geocode(row.get("citation_location") or "")
+        if pt is None:
+            failed += 1
+            continue
+        geocoded += 1
+        lat, lon = pt
+        key = (math.floor(lat / LAT_STEP), math.floor(lon / LON_STEP))
+        cat = categories.categorize(row.get("violation_desc"))
+        hour_of_week = ts.weekday() * 24 + ts.hour
+        cell = cells[key]
+        cell["t"] += 1
+        cell["c"][cat] += 1
+        cell["h"][hour_of_week] += 1
+        if data_through is None or ts > data_through:
+            data_through = ts
+
+    log(f"  geocoded {geocoded:,} / {geocoded + failed:,} "
+        f"({geocoded / max(1, geocoded + failed):.1%})")
+
+    totals = sorted(c["t"] for c in cells.values())
+    hour_values = sorted(v for c in cells.values() for v in c["h"].values())
+
+    def p95(values):
+        return values[int(len(values) * 0.95)] if values else 1
+
+    return {
+        "meta": {
+            "source": categories.SOURCE_PARKING_SFMTA,
+            "latStep": LAT_STEP,
+            "lonStep": LON_STEP,
+            "months": months,
+            "generatedAt": now.isoformat(timespec="seconds"),
+            "dataThrough": data_through.isoformat(timespec="seconds") if data_through else None,
+            "totalCitations": geocoded,
+            "totalP95": p95(totals),
+            "hourP95": p95(hour_values),
+        },
+        "cells": [
+            {
+                "k": f"{k[0]}_{k[1]}",
+                "t": c["t"],
+                "c": dict(c["c"]),
+                "h": {str(h): n for h, n in sorted(c["h"].items())},
+            }
+            for k, c in sorted(cells.items())
+        ],
+    }
+
+
+# ----------------------------------------------------------------- sweeping
+
+def build_sweeping(now: datetime) -> dict:
+    blocks = []
+    for row in soda.fetch_all(soda.SWEEPING):
+        day = WEEKDAYS.get((row.get("weekday") or "").strip().lower())
+        line = row.get("line") or {}
+        coords = line.get("coordinates") or []
+        if day is None or not coords:
+            continue
+        try:
+            from_hour = int(row["fromhour"])
+            to_hour = int(row["tohour"])
+        except (KeyError, ValueError):
+            continue
+        blocks.append({
+            "corridor": row.get("corridor") or "",
+            "limits": row.get("limits") or "",
+            "side": row.get("blockside") or "",
+            "day": day,
+            "from": from_hour,
+            "to": to_hour,
+            "weeks": [int(row.get(f"week{i}") or 0) for i in range(1, 6)],
+            "holidays": int(row.get("holidays") or 0),
+            # GeoJSON is [lon, lat]; emit [lat, lon] rounded to ~1 m
+            "line": [[round(c[1], 5), round(c[0], 5)] for c in coords],
+        })
+    return {
+        "meta": {"generatedAt": now.isoformat(timespec="seconds")},
+        "blocks": blocks,
+    }
+
+
+# ------------------------------------------------------------------- meters
+
+def build_meters(now: datetime) -> dict:
+    meter_points: dict[str, tuple[float, float]] = {}
+    for row in soda.fetch_all(soda.METERS,
+                              select="post_id,latitude,longitude,active_meter_flag"):
+        if (row.get("active_meter_flag") or "").upper() not in ("M", "P"):
+            continue
+        try:
+            meter_points[row["post_id"]] = (float(row["latitude"]), float(row["longitude"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    groups: dict[tuple[str, str], dict] = defaultdict(
+        lambda: {"posts": set(), "schedules": Counter(), "colors": Counter()})
+    for row in soda.fetch_all(soda.METER_SCHEDULES):
+        if row.get("schedule_type") != "Operating Schedule":
+            continue
+        post = row.get("post_id")
+        if post not in meter_points:
+            continue
+        key = (row.get("street_and_block") or "", row.get("block_side") or "")
+        g = groups[key]
+        g["posts"].add(post)
+        g["schedules"][(row.get("days_applied") or "",
+                        row.get("from_time") or "",
+                        row.get("to_time") or "",
+                        row.get("time_limit") or "")] += 1
+        g["colors"][row.get("cap_color") or "Grey"] += 1
+
+    blocks = []
+    for (block, side), g in sorted(groups.items()):
+        pts = [meter_points[p] for p in g["posts"]]
+        if not pts:
+            continue
+        lat = sum(p[0] for p in pts) / len(pts)
+        lon = sum(p[1] for p in pts) / len(pts)
+        days, from_t, to_t, limit = g["schedules"].most_common(1)[0][0]
+        blocks.append({
+            "b": block,
+            "s": side,
+            "lat": round(lat, 5),
+            "lon": round(lon, 5),
+            "n": len(g["posts"]),
+            "days": days,
+            "from": from_t,
+            "to": to_t,
+            "limit": limit,
+            "color": g["colors"].most_common(1)[0][0],
+        })
+    return {
+        "meta": {"generatedAt": now.isoformat(timespec="seconds")},
+        "blocks": blocks,
+    }
+
+
+# --------------------------------------------------------------------- main
+
+def write_json(name: str, payload: dict) -> str:
+    os.makedirs(OUTPUT, exist_ok=True)
+    path = os.path.join(OUTPUT, name)
+    with open(path, "w") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    log(f"  wrote {name} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--months", type=int, default=12)
+    parser.add_argument("--no-cache", action="store_true",
+                        help="ignore local cache (CI always refetches recent months anyway)")
+    args = parser.parse_args()
+    use_cache = not args.no_cache
+    now = datetime.now()
+
+    log("[1/5] Building geocoder from EAS address points...")
+    gc = build_geocoder(use_cache)
+
+    log(f"[2/5] Fetching {args.months} months of citations...")
+    rows = fetch_citations(args.months, now, use_cache)
+    log(f"  total: {len(rows):,} rows")
+
+    log("[3/5] Geocoding + aggregating risk grid...")
+    risk = build_risk_grid(rows, gc, args.months, now)
+    write_json("risk_grid.json", risk)
+
+    log("[4/5] Building street sweeping schedule...")
+    sweeping = build_sweeping(now)
+    log(f"  {len(sweeping['blocks']):,} blockfaces")
+    write_json("sweeping.json", sweeping)
+
+    log("[5/5] Building metered blocks...")
+    meters = build_meters(now)
+    log(f"  {len(meters['blocks']):,} metered block-sides")
+    write_json("meters.json", meters)
+
+    manifest = {
+        "version": 1,
+        "generatedAt": now.isoformat(timespec="seconds"),
+        "dataThrough": risk["meta"]["dataThrough"],
+        "sources": [categories.SOURCE_PARKING_SFMTA],
+        "files": {
+            "riskGrid": "risk_grid.json",
+            "sweeping": "sweeping.json",
+            "meters": "meters.json",
+        },
+    }
+    write_json("manifest.json", manifest)
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()
