@@ -288,6 +288,98 @@ def build_sweeping(now: datetime) -> dict:
     }
 
 
+# -------------------------------------------------------------- regulations
+
+# Normalize the dataset's inconsistent regulation labels to stable keys the
+# app can reason about.
+_REGULATION_KINDS = {
+    "time limited": "timeLimit",
+    "time limited ": "timeLimit",
+    "no parking any time": "noParking",
+    "no parking anytime": "noParking",
+    "no stopping": "noParking",
+    "limited no parking": "limitedNoParking",
+    "no overnight parking": "noOvernight",
+    "government permit": "governmentPermit",
+    "pay or permit": "payOrPermit",
+    "paid + permit": "payOrPermit",
+    "no oversized vehicles": "noOversized",
+}
+
+_DAY_TOKENS = {
+    "M": [0], "TU": [1], "W": [2], "TH": [3], "F": [4], "SA": [5], "SU": [6],
+}
+
+
+def _parse_reg_days(days: str | None) -> list[int]:
+    """'M-F' / 'M-Sa' / 'Daily' / 'M,W,F' -> weekday list (Mon=0). Empty = all."""
+    if not days:
+        return list(range(7))
+    s = days.strip().upper().replace(".", "")
+    if s in ("DAILY", "EVERYDAY", "EVERY DAY", "ALL", "24/7"):
+        return list(range(7))
+    order = ["M", "TU", "W", "TH", "F", "SA", "SU"]
+    if "-" in s:
+        parts = [p.strip() for p in s.split("-", 1)]
+        try:
+            start = order.index(parts[0])
+            end = order.index(parts[1])
+            if start <= end:
+                return list(range(start, end + 1))
+        except ValueError:
+            return list(range(7))
+    result = []
+    for token in s.replace("/", ",").split(","):
+        result.extend(_DAY_TOKENS.get(token.strip(), []))
+    return sorted(set(result)) or list(range(7))
+
+
+def _parse_military(value) -> int | None:
+    """'900' -> 9, '1800' -> 18; clamps to whole hours."""
+    try:
+        v = int(float(value))
+        return max(0, min(24, v // 100))
+    except (TypeError, ValueError):
+        return None
+
+
+def build_regulations(now: datetime) -> dict:
+    blocks = []
+    for row in soda.fetch_all(soda.REGULATIONS):
+        kind = _REGULATION_KINDS.get((row.get("regulation") or "").strip().lower())
+        if kind is None or kind == "noOversized":  # irrelevant to passenger cars
+            continue
+        shape = row.get("shape") or {}
+        coords_multi = shape.get("coordinates") or []
+        # MultiLineString -> flatten first line, [lon, lat] -> [lat, lon]
+        line = coords_multi[0] if coords_multi else []
+        if len(line) < 2:
+            continue
+        rpp_area = (row.get("rpparea1") or "").strip()
+        if rpp_area in ("N", "-", ""):
+            rpp_area = None
+        try:
+            hr_limit = float(row.get("hrlimit")) if row.get("hrlimit") else None
+        except ValueError:
+            hr_limit = None
+        blocks.append({
+            "kind": kind,
+            "days": _parse_reg_days(row.get("days")),
+            "from": _parse_military(row.get("hrs_begin")),
+            "to": _parse_military(row.get("hrs_end")),
+            "limit": hr_limit,
+            "rpp": rpp_area,
+            "line": [[round(c[1], 5), round(c[0], 5)] for c in line],
+        })
+    return {
+        "meta": {
+            "generatedAt": now.isoformat(timespec="seconds"),
+            "note": "SFMTA warns this dataset is not comprehensively vetted",
+        },
+        "blocks": blocks,
+    }
+
+
 # ------------------------------------------------------------------- meters
 
 def build_meters(now: datetime) -> dict:
@@ -364,14 +456,14 @@ def main():
     use_cache = not args.no_cache
     now = datetime.now()
 
-    log("[1/5] Building geocoder from EAS address points...")
+    log("[1/6] Building geocoder from EAS address points...")
     gc = build_geocoder(use_cache)
 
-    log(f"[2/5] Fetching {args.months} months of citations...")
+    log(f"[2/6] Fetching {args.months} months of citations...")
     rows = fetch_citations(args.months, now, use_cache)
     log(f"  total: {len(rows):,} rows")
 
-    log("[3/5] Geocoding + aggregating risk grid...")
+    log("[3/6] Geocoding + aggregating risk grid...")
     risk, shards = build_risk_grid(rows, gc, args.months, now)
     write_json("risk_grid.json", risk)
 
@@ -385,18 +477,23 @@ def main():
         shard_bytes += os.path.getsize(path)
     log(f"  wrote {len(shards):,} detail shards ({shard_bytes / 1e6:.1f} MB total)")
 
-    log("[4/5] Building street sweeping schedule...")
+    log("[4/6] Building street sweeping schedule...")
     sweeping = build_sweeping(now)
     log(f"  {len(sweeping['blocks']):,} blockfaces")
     write_json("sweeping.json", sweeping)
 
-    log("[5/5] Building metered blocks...")
+    log("[5/6] Building metered blocks...")
     meters = build_meters(now)
     log(f"  {len(meters['blocks']):,} metered block-sides")
     write_json("meters.json", meters)
 
+    log("[6/6] Building parking regulations (RPP / time limits)...")
+    regulations = build_regulations(now)
+    log(f"  {len(regulations['blocks']):,} regulated blockfaces")
+    write_json("regulations.json", regulations)
+
     manifest = {
-        "version": 2,
+        "version": 3,
         "generatedAt": now.isoformat(timespec="seconds"),
         "dataThrough": risk["meta"]["dataThrough"],
         "sources": [categories.SOURCE_PARKING_SFMTA],
@@ -404,6 +501,7 @@ def main():
             "riskGrid": "risk_grid.json",
             "sweeping": "sweeping.json",
             "meters": "meters.json",
+            "regulations": "regulations.json",
             "detailsDir": "details",
         },
     }

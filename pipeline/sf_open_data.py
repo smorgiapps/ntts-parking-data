@@ -13,6 +13,7 @@ ADDRESSES = "ramy-di5m"        # Addresses - Enterprise Addressing System
 SWEEPING = "yhqp-riqs"         # Street Sweeping Schedule
 METERS = "8vzz-qzz9"           # Parking Meters
 METER_SCHEDULES = "6cqg-dxku"  # Meter Operating Schedules
+REGULATIONS = "hi6h-neyh"      # Parking regulations (except non-metered color curb)
 
 PAGE_SIZE = 50_000
 MAX_RETRIES = 5
