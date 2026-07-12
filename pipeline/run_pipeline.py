@@ -31,6 +31,11 @@ OUTPUT = os.path.join(HERE, "output")
 LAT_STEP = 0.001    # ~111 m
 LON_STEP = 0.00125  # ~110 m at SF latitude
 
+# Detail shards group TILE_FACTOR x TILE_FACTOR cells (~550 m squares) so the
+# app can fetch citation-level records on demand per neighborhood.
+TILE_FACTOR = 5
+MAX_STREETS_PER_CELL = 8
+
 WEEKDAYS = {
     "mon": 0, "monday": 0,
     "tues": 1, "tue": 1, "tuesday": 1,
@@ -105,9 +110,30 @@ def build_geocoder(use_cache: bool) -> Geocoder:
     return gc
 
 
-def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) -> dict:
-    cells: dict[tuple[int, int], dict] = defaultdict(
-        lambda: {"t": 0, "c": Counter(), "h": Counter()})
+def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) -> tuple[dict, dict]:
+    """Returns (risk_grid, detail_shards).
+
+    risk_grid cells carry aggregates: total (t), per-category counts (c),
+    hour-of-week counts (h), per-category hour-of-week counts (ch),
+    per-category last-cited date (cl), and a per-street breakdown (s).
+
+    detail_shards maps tile key -> shard payload with citation-level records
+    (newest first) for on-demand drill-down in the app.
+    """
+    def new_cell():
+        return {
+            "t": 0, "c": Counter(), "h": Counter(),
+            "ch": defaultdict(Counter),          # cat -> hour-of-week -> n
+            "cl": {},                            # cat -> latest datetime
+            "f": 0,                              # total fines ($)
+            "m": Counter(),                      # "YYYYMM" -> n (trend)
+            "streets": defaultdict(lambda: {     # street -> aggregates
+                "t": 0, "c": Counter(), "b": Counter(), "l": None}),
+        }
+
+    cells: dict[tuple[int, int], dict] = defaultdict(new_cell)
+    # tile key -> cell key -> [(ts, cat, street, block, fine), ...]
+    shards: dict[tuple[int, int], dict] = defaultdict(lambda: defaultdict(list))
     geocoded = failed = 0
     data_through = None
 
@@ -118,19 +144,41 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
             continue
         if ts > now + timedelta(days=1):  # bad future-dated rows exist upstream
             continue
-        pt = gc.geocode(row.get("citation_location") or "")
-        if pt is None:
+        hit = gc.geocode_full(row.get("citation_location") or "")
+        if hit is None:
             failed += 1
             continue
         geocoded += 1
-        lat, lon = pt
+        lat, lon, street, block = hit
+        try:
+            fine = int(float(row.get("fine_amount") or 0))
+        except ValueError:
+            fine = 0
         key = (math.floor(lat / LAT_STEP), math.floor(lon / LON_STEP))
         cat = categories.categorize(row.get("violation_desc"))
         hour_of_week = ts.weekday() * 24 + ts.hour
+
         cell = cells[key]
         cell["t"] += 1
         cell["c"][cat] += 1
         cell["h"][hour_of_week] += 1
+        cell["ch"][cat][hour_of_week] += 1
+        cell["f"] += fine
+        cell["m"][ts.strftime("%Y%m")] += 1
+        if cat not in cell["cl"] or ts > cell["cl"][cat]:
+            cell["cl"][cat] = ts
+
+        st = cell["streets"][street]
+        st["t"] += 1
+        st["c"][cat] += 1
+        st["b"][block] += 1
+        if st["l"] is None or ts > st["l"]:
+            st["l"] = ts
+
+        tile = (key[0] // TILE_FACTOR, key[1] // TILE_FACTOR)
+        shards[tile][f"{key[0]}_{key[1]}"].append(
+            (ts.isoformat(timespec="minutes"), cat, street, block, fine))
+
         if data_through is None or ts > data_through:
             data_through = ts
 
@@ -143,11 +191,25 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
     def p95(values):
         return values[int(len(values) * 0.95)] if values else 1
 
-    return {
+    def street_entries(cell):
+        ranked = sorted(cell["streets"].items(), key=lambda kv: -kv[1]["t"])
+        return [
+            {
+                "n": name,
+                "b": st["b"].most_common(1)[0][0],
+                "t": st["t"],
+                "c": dict(st["c"]),
+                "l": st["l"].strftime("%Y-%m-%d") if st["l"] else None,
+            }
+            for name, st in ranked[:MAX_STREETS_PER_CELL]
+        ]
+
+    grid = {
         "meta": {
             "source": categories.SOURCE_PARKING_SFMTA,
             "latStep": LAT_STEP,
             "lonStep": LON_STEP,
+            "tileFactor": TILE_FACTOR,
             "months": months,
             "generatedAt": now.isoformat(timespec="seconds"),
             "dataThrough": data_through.isoformat(timespec="seconds") if data_through else None,
@@ -161,10 +223,36 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
                 "t": c["t"],
                 "c": dict(c["c"]),
                 "h": {str(h): n for h, n in sorted(c["h"].items())},
+                "ch": {cat: {str(h): n for h, n in sorted(hours.items())}
+                       for cat, hours in sorted(c["ch"].items())},
+                "cl": {cat: ts.strftime("%Y-%m-%d") for cat, ts in sorted(c["cl"].items())},
+                "f": c["f"],
+                "m": {ym: n for ym, n in sorted(c["m"].items())},
+                "s": street_entries(c),
             }
             for k, c in sorted(cells.items())
         ],
     }
+
+    shard_payloads = {}
+    for tile, tile_cells in shards.items():
+        street_table: list[str] = []
+        street_index: dict[str, int] = {}
+        cells_out = {}
+        for cell_key, records in tile_cells.items():
+            records.sort(key=lambda r: r[0], reverse=True)  # newest first
+            out = []
+            for ts, cat, street, block, fine in records:
+                if street not in street_index:
+                    street_index[street] = len(street_table)
+                    street_table.append(street)
+                out.append([ts, cat, street_index[street], block, fine])
+            cells_out[cell_key] = out
+        shard_payloads[f"{tile[0]}_{tile[1]}"] = {
+            "streets": street_table,
+            "cells": cells_out,
+        }
+    return grid, shard_payloads
 
 
 # ----------------------------------------------------------------- sweeping
@@ -284,8 +372,18 @@ def main():
     log(f"  total: {len(rows):,} rows")
 
     log("[3/5] Geocoding + aggregating risk grid...")
-    risk = build_risk_grid(rows, gc, args.months, now)
+    risk, shards = build_risk_grid(rows, gc, args.months, now)
     write_json("risk_grid.json", risk)
+
+    shard_dir = os.path.join(OUTPUT, "details")
+    os.makedirs(shard_dir, exist_ok=True)
+    shard_bytes = 0
+    for tile_key, payload in shards.items():
+        path = os.path.join(shard_dir, f"{tile_key}.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        shard_bytes += os.path.getsize(path)
+    log(f"  wrote {len(shards):,} detail shards ({shard_bytes / 1e6:.1f} MB total)")
 
     log("[4/5] Building street sweeping schedule...")
     sweeping = build_sweeping(now)
@@ -298,7 +396,7 @@ def main():
     write_json("meters.json", meters)
 
     manifest = {
-        "version": 1,
+        "version": 2,
         "generatedAt": now.isoformat(timespec="seconds"),
         "dataThrough": risk["meta"]["dataThrough"],
         "sources": [categories.SOURCE_PARKING_SFMTA],
@@ -306,6 +404,7 @@ def main():
             "riskGrid": "risk_grid.json",
             "sweeping": "sweeping.json",
             "meters": "meters.json",
+            "detailsDir": "details",
         },
     }
     write_json("manifest.json", manifest)

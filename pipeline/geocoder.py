@@ -76,6 +76,11 @@ class Geocoder:
         self._street_names = sorted(self._types_for_street.keys())
 
     def geocode(self, location: str) -> tuple[float, float] | None:
+        r = self.geocode_full(location)
+        return (r[0], r[1]) if r else None
+
+    def geocode_full(self, location: str) -> tuple[float, float, str, int] | None:
+        """Returns (lat, lon, canonical street label e.g. 'PINE ST', block number)."""
         m = _LOCATION.match(location or "")
         if not m:
             return None
@@ -86,7 +91,12 @@ class Geocoder:
         resolved = self._resolve_street(street)
         if resolved is None:
             return None
-        return self._lookup(resolved, stype, num)
+        hit = self._lookup(resolved, stype, num)
+        if hit is None:
+            return None
+        lat, lon, used_type = hit
+        label = f"{resolved} {used_type}".strip()
+        return lat, lon, label, (num // 100) * 100
 
     def _split_street_type(self, rest: str) -> tuple[str, str | None]:
         parts = rest.split(" ")
@@ -104,7 +114,7 @@ class Geocoder:
         self._fuzzy_cache[street] = result
         return result
 
-    def _lookup(self, street: str, stype: str | None, num: int) -> tuple[float, float] | None:
+    def _lookup(self, street: str, stype: str | None, num: int) -> tuple[float, float, str] | None:
         types = self._types_for_street[street]
         candidates = []
         if stype and stype in types:
@@ -114,7 +124,7 @@ class Geocoder:
             # one whose address range actually contains the number.
             candidates = list(types)
 
-        best = None  # (distance, lat, lon)
+        best = None  # (distance, lat, lon, street_type)
         for t in candidates:
             pts = self._by_street_type.get((street, t))
             if not pts:
@@ -124,8 +134,8 @@ class Geocoder:
                 if 0 <= j < len(pts):
                     d = abs(pts[j][0] - num)
                     if best is None or d < best[0]:
-                        best = (d, pts[j][1], pts[j][2])
+                        best = (d, pts[j][1], pts[j][2], t)
         # Reject matches more than ~2 blocks of house numbers away.
         if best is None or best[0] > 200:
             return None
-        return best[1], best[2]
+        return best[1], best[2], best[3]
