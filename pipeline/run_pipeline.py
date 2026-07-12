@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 import categories
+import curb_rules
 import sf_open_data as soda
 from geocoder import Geocoder
 
@@ -487,13 +488,27 @@ def main():
     log(f"  {len(meters['blocks']):,} metered block-sides")
     write_json("meters.json", meters)
 
-    log("[6/6] Building parking regulations (RPP / time limits)...")
+    log("[6/7] Building parking regulations (RPP / time limits)...")
     regulations = build_regulations(now)
     log(f"  {len(regulations['blocks']):,} regulated blockfaces")
     write_json("regulations.json", regulations)
 
+    log("[7/7] Building SFMTA Digital Curb rule shards...")
+    os.makedirs(CACHE, exist_ok=True)
+    curb_shards = curb_rules.build_curb_shards(
+        CACHE, LAT_STEP, LON_STEP, TILE_FACTOR, log)
+    curb_dir = os.path.join(OUTPUT, "curb")
+    os.makedirs(curb_dir, exist_ok=True)
+    curb_bytes = 0
+    for tile_key, payload in curb_shards.items():
+        path = os.path.join(curb_dir, f"{tile_key}.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        curb_bytes += os.path.getsize(path)
+    log(f"  wrote {len(curb_shards):,} curb shards ({curb_bytes / 1e6:.1f} MB total)")
+
     manifest = {
-        "version": 3,
+        "version": 4,
         "generatedAt": now.isoformat(timespec="seconds"),
         "dataThrough": risk["meta"]["dataThrough"],
         "sources": [categories.SOURCE_PARKING_SFMTA],
@@ -503,6 +518,7 @@ def main():
             "meters": "meters.json",
             "regulations": "regulations.json",
             "detailsDir": "details",
+            "curbDir": "curb",
         },
     }
     write_json("manifest.json", manifest)
