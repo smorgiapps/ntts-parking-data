@@ -139,3 +139,32 @@ class Geocoder:
         if best is None or best[0] > 200:
             return None
         return best[1], best[2], best[3]
+
+    def block_parity_centroids(
+        self, street_label: str, block: int
+    ) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+        """Centroids of odd- and even-numbered EAS points on ``block`` (e.g. 1400)."""
+        street, stype = self._split_street_type(_norm_street(street_label))
+        resolved = self._resolve_street(street)
+        if resolved is None:
+            return None, None
+        types = [stype] if stype and stype in self._types_for_street.get(resolved, set()) else list(
+            self._types_for_street.get(resolved, [])
+        )
+        lo, hi = block, block + 99
+        odd_pts: list[tuple[float, float]] = []
+        even_pts: list[tuple[float, float]] = []
+        for t in types:
+            for num, lat, lon in self._by_street_type.get((resolved, t), []):
+                if lo <= num <= hi:
+                    (odd_pts if num % 2 else even_pts).append((lat, lon))
+        def centroid(pts: list[tuple[float, float]]) -> tuple[float, float] | None:
+            if not pts:
+                return None
+            return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        return centroid(odd_pts), centroid(even_pts)
+
+
+def address_number(location: str) -> int | None:
+    m = _LOCATION.match(location or "")
+    return int(m.group(1)) if m else None

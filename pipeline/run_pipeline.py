@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import categories
 import curb_rules
 import sf_open_data as soda
+import street_rules
 from geocoder import Geocoder
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +52,15 @@ WEEKDAYS = {
 def log(msg: str):
     print(msg, flush=True)
     sys.stdout.flush()
+
+
+def _write_insights(risk: dict) -> None:
+    """Emit insights.json baseline summaries (template; optional LLM in generate_insights.py)."""
+    import generate_insights
+
+    insights = generate_insights.build_insights(risk, min_citations=10)
+    write_json("insights.json", insights)
+    log(f"  insights: {len(insights):,} block baselines")
 
 
 # ---------------------------------------------------------------- citations
@@ -129,7 +139,8 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
             "f": 0,                              # total fines ($)
             "m": Counter(),                      # "YYYYMM" -> n (trend)
             "streets": defaultdict(lambda: {     # street -> aggregates
-                "t": 0, "c": Counter(), "b": Counter(), "l": None}),
+                "t": 0, "c": Counter(), "b": Counter(), "l": None,
+                "ch": defaultdict(Counter)}),
         }
 
     cells: dict[tuple[int, int], dict] = defaultdict(new_cell)
@@ -156,7 +167,7 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
         except ValueError:
             fine = 0
         key = (math.floor(lat / LAT_STEP), math.floor(lon / LON_STEP))
-        cat = categories.categorize(row.get("violation_desc"))
+        cat, subtype, _, _ = categories.classify(row.get("violation_desc"))
         hour_of_week = ts.weekday() * 24 + ts.hour
 
         cell = cells[key]
@@ -173,12 +184,17 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
         st["t"] += 1
         st["c"][cat] += 1
         st["b"][block] += 1
+        st["ch"][cat][hour_of_week] += 1
         if st["l"] is None or ts > st["l"]:
             st["l"] = ts
 
         tile = (key[0] // TILE_FACTOR, key[1] // TILE_FACTOR)
+        viol_code = (row.get("violation") or "").strip()
+        viol_desc = (row.get("violation_desc") or "").strip()
+        location_raw = (row.get("citation_location") or "").strip()
         shards[tile][f"{key[0]}_{key[1]}"].append(
-            (ts.isoformat(timespec="minutes"), cat, street, block, fine))
+            (ts.isoformat(timespec="minutes"), cat, subtype, street, block, fine,
+             viol_code, viol_desc, location_raw))
 
         if data_through is None or ts > data_through:
             data_through = ts
@@ -194,16 +210,33 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
 
     def street_entries(cell):
         ranked = sorted(cell["streets"].items(), key=lambda kv: -kv[1]["t"])
-        return [
-            {
+        entries = []
+        for name, st in ranked[:MAX_STREETS_PER_CELL]:
+            block = st["b"].most_common(1)[0][0]
+            entry = {
                 "n": name,
-                "b": st["b"].most_common(1)[0][0],
+                "b": block,
                 "t": st["t"],
                 "c": dict(st["c"]),
                 "l": st["l"].strftime("%Y-%m-%d") if st["l"] else None,
+                "ch": {cat: {str(h): n for h, n in sorted(hours.items())}
+                       for cat, hours in sorted(st["ch"].items())},
             }
-            for name, st in ranked[:MAX_STREETS_PER_CELL]
-        ]
+            # Geocoded block center so the app can match posted rules to the
+            # correct street in dense grids (parallel streets are ~25 m apart).
+            hit = gc.geocode_full(f"{block} {name}")
+            if hit:
+                entry["g"] = [round(hit[0], 5), round(hit[1], 5)]
+            # Extra sample points along the block for corridor tow-away matching.
+            extra_refs = []
+            for off in (-100, 100):
+                ref = gc.geocode_full(f"{block + off} {name}")
+                if ref:
+                    extra_refs.append([round(ref[0], 5), round(ref[1], 5)])
+            if extra_refs:
+                entry["gr"] = extra_refs
+            entries.append(entry)
+        return entries
 
     grid = {
         "meta": {
@@ -243,11 +276,12 @@ def build_risk_grid(rows: list[dict], gc: Geocoder, months: int, now: datetime) 
         for cell_key, records in tile_cells.items():
             records.sort(key=lambda r: r[0], reverse=True)  # newest first
             out = []
-            for ts, cat, street, block, fine in records:
+            for ts, cat, subtype, street, block, fine, viol_code, viol_desc, location_raw in records:
                 if street not in street_index:
                     street_index[street] = len(street_table)
                     street_table.append(street)
-                out.append([ts, cat, street_index[street], block, fine])
+                out.append([ts, cat, subtype, street_index[street], block, fine,
+                            viol_code, viol_desc, location_raw])
             cells_out[cell_key] = out
         shard_payloads[f"{tile[0]}_{tile[1]}"] = {
             "streets": street_table,
@@ -453,20 +487,78 @@ def main():
     parser.add_argument("--months", type=int, default=12)
     parser.add_argument("--no-cache", action="store_true",
                         help="ignore local cache (CI always refetches recent months anyway)")
+    parser.add_argument("--regrid", action="store_true",
+                        help="rebuild risk grid + bind rules only (reuse cached citations)")
     args = parser.parse_args()
     use_cache = not args.no_cache
     now = datetime.now()
 
-    log("[1/6] Building geocoder from EAS address points...")
+    if args.regrid:
+        log("[regrid] Rebuilding risk grid from cached citations...")
+        gc = build_geocoder(use_cache)
+        rows = fetch_citations(args.months, now, use_cache)
+        risk, shards = build_risk_grid(rows, gc, args.months, now)
+        shard_dir = os.path.join(OUTPUT, "details")
+        os.makedirs(shard_dir, exist_ok=True)
+        for tile_key, payload in shards.items():
+            with open(os.path.join(shard_dir, f"{tile_key}.json"), "w") as f:
+                json.dump(payload, f, separators=(",", ":"))
+        regulations = json.load(open(os.path.join(OUTPUT, "regulations.json")))
+        sweeping = json.load(open(os.path.join(OUTPUT, "sweeping.json")))
+        meters = json.load(open(os.path.join(OUTPUT, "meters.json")))
+        curb_shards = {}
+        for fname in os.listdir(os.path.join(OUTPUT, "curb")):
+            if fname.endswith(".json"):
+                with open(os.path.join(OUTPUT, "curb", fname)) as f:
+                    curb_shards[fname[:-5]] = json.load(f)
+        log("[regrid] Binding posted rules to streets...")
+        risk = street_rules.bind_street_rules(risk, regulations, sweeping, meters,
+                                            curb_shards, log,
+                                            lat_step=LAT_STEP, lon_step=LON_STEP,
+                                            tile_factor=TILE_FACTOR,
+                                            geocoder=gc, detail_shards=shards)
+        errors = street_rules.validate_known_blocks(risk)
+        if errors:
+            for err in errors:
+                log(f"  VALIDATION FAIL: {err}")
+            sys.exit(1)
+        block_errors = street_rules.validate_block_side_rules(risk)
+        if block_errors:
+            for err in block_errors:
+                log(f"  VALIDATION FAIL: {err}")
+            sys.exit(1)
+        write_json("risk_grid.json", risk)
+        write_json("violation_index.json", categories.build_violation_index())
+        _write_insights(risk)
+        manifest = {
+            "version": 6,
+            "generatedAt": now.isoformat(timespec="seconds"),
+            "dataThrough": risk["meta"]["dataThrough"],
+            "sources": [categories.SOURCE_PARKING_SFMTA],
+            "files": {
+                "riskGrid": "risk_grid.json",
+                "sweeping": "sweeping.json",
+                "meters": "meters.json",
+                "regulations": "regulations.json",
+                "detailsDir": "details",
+                "curbDir": "curb",
+                "violationIndex": "violation_index.json",
+                "insights": "insights.json",
+            },
+        }
+        write_json("manifest.json", manifest)
+        log("Done (regrid).")
+        return
+
+    log("[1/8] Building geocoder from EAS address points...")
     gc = build_geocoder(use_cache)
 
-    log(f"[2/6] Fetching {args.months} months of citations...")
+    log(f"[2/8] Fetching {args.months} months of citations...")
     rows = fetch_citations(args.months, now, use_cache)
     log(f"  total: {len(rows):,} rows")
 
-    log("[3/6] Geocoding + aggregating risk grid...")
+    log("[3/8] Geocoding + aggregating risk grid...")
     risk, shards = build_risk_grid(rows, gc, args.months, now)
-    write_json("risk_grid.json", risk)
 
     shard_dir = os.path.join(OUTPUT, "details")
     os.makedirs(shard_dir, exist_ok=True)
@@ -478,22 +570,22 @@ def main():
         shard_bytes += os.path.getsize(path)
     log(f"  wrote {len(shards):,} detail shards ({shard_bytes / 1e6:.1f} MB total)")
 
-    log("[4/6] Building street sweeping schedule...")
+    log("[4/8] Building street sweeping schedule...")
     sweeping = build_sweeping(now)
     log(f"  {len(sweeping['blocks']):,} blockfaces")
     write_json("sweeping.json", sweeping)
 
-    log("[5/6] Building metered blocks...")
+    log("[5/8] Building metered blocks...")
     meters = build_meters(now)
     log(f"  {len(meters['blocks']):,} metered block-sides")
     write_json("meters.json", meters)
 
-    log("[6/7] Building parking regulations (RPP / time limits)...")
+    log("[6/8] Building parking regulations (RPP / time limits)...")
     regulations = build_regulations(now)
     log(f"  {len(regulations['blocks']):,} regulated blockfaces")
     write_json("regulations.json", regulations)
 
-    log("[7/7] Building SFMTA Digital Curb rule shards...")
+    log("[7/8] Building SFMTA Digital Curb rule shards...")
     os.makedirs(CACHE, exist_ok=True)
     curb_shards = curb_rules.build_curb_shards(
         CACHE, LAT_STEP, LON_STEP, TILE_FACTOR, log)
@@ -507,8 +599,29 @@ def main():
         curb_bytes += os.path.getsize(path)
     log(f"  wrote {len(curb_shards):,} curb shards ({curb_bytes / 1e6:.1f} MB total)")
 
+    log("[8/8] Binding posted rules to streets (v5)...")
+    risk = street_rules.bind_street_rules(risk, regulations, sweeping, meters,
+                                        curb_shards, log,
+                                        lat_step=LAT_STEP, lon_step=LON_STEP,
+                                        tile_factor=TILE_FACTOR,
+                                        geocoder=gc, detail_shards=shards)
+    errors = street_rules.validate_known_blocks(risk)
+    if errors:
+        for err in errors:
+            log(f"  VALIDATION FAIL: {err}")
+        sys.exit(1)
+    block_errors = street_rules.validate_block_side_rules(risk)
+    if block_errors:
+        for err in block_errors:
+            log(f"  VALIDATION FAIL: {err}")
+        sys.exit(1)
+    log("  validation passed (900 Pine / 1400 Pine / 800 Taylor / 800 Bush)")
+    write_json("risk_grid.json", risk)
+    write_json("violation_index.json", categories.build_violation_index())
+    _write_insights(risk)
+
     manifest = {
-        "version": 4,
+        "version": 6,
         "generatedAt": now.isoformat(timespec="seconds"),
         "dataThrough": risk["meta"]["dataThrough"],
         "sources": [categories.SOURCE_PARKING_SFMTA],
@@ -519,6 +632,8 @@ def main():
             "regulations": "regulations.json",
             "detailsDir": "details",
             "curbDir": "curb",
+            "violationIndex": "violation_index.json",
+            "insights": "insights.json",
         },
     }
     write_json("manifest.json", manifest)
