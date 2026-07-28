@@ -70,9 +70,26 @@ def backfill_block_refs(risk: dict, gc: Geocoder, log_fn) -> int:
     return added
 
 
+def _snapshot_afternoon_np(risk: dict) -> dict:
+    """Lightweight pre-bind snapshot for citywide split reporting."""
+    snap: dict = {"cells": []}
+    for cell in risk.get("cells") or []:
+        streets = []
+        for street in cell.get("s") or []:
+            rules = [
+                {"k": r.get("k"), "f": r.get("f"), "t": r.get("t"), "side": r.get("side")}
+                for r in (street.get("rules") or [])
+                if r.get("k") == "np"
+            ]
+            streets.append({"n": street.get("n"), "b": street.get("b"), "rules": rules})
+        snap["cells"].append({"k": cell.get("k"), "s": streets})
+    return snap
+
+
 def main() -> int:
     log("Loading existing pipeline output...")
     risk = load_json("risk_grid.json")
+    old_np = _snapshot_afternoon_np(risk)
     regulations = load_json("regulations.json")
     sweeping = load_json("sweeping.json")
     meters = load_json("meters.json")
@@ -100,6 +117,13 @@ def main() -> int:
             log(f"VALIDATION FAIL: {err}")
         return 1
     log("Validation passed.")
+
+    splits = street_rules.report_afternoon_np_splits(old_np, risk)
+    log(f"Citywide afternoon np splits (unsided→distinct ends): {len(splits)}")
+    for line in splits[:40]:
+        log(f"  {line}")
+    if len(splits) > 40:
+        log(f"  … and {len(splits) - 40} more")
 
     out = os.path.join(OUTPUT, "risk_grid.json")
     with open(out, "w") as f:

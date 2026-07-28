@@ -29,6 +29,10 @@ MIN_NP_SEGMENT_M = 15.0
 # Citations in matching hour-band needed to mark a tow-away "confirmed".
 CORROBORATION_MIN = 2
 
+# Nearest sweeping/parity side must beat the opposite by this margin (meters).
+SIDE_MARGIN_M = 4.0
+_OPPOSITE_SIDE = {"North": "South", "South": "North", "East": "West", "West": "East"}
+
 _SUFFIX = {
     "STREET": "ST", "AVENUE": "AVE", "BOULEVARD": "BLVD", "DRIVE": "DR",
     "COURT": "CT", "PLACE": "PL", "LANE": "LN", "ROAD": "RD",
@@ -215,6 +219,121 @@ def _build_citation_index(shards: dict[str, dict]) -> dict[tuple[str, str], list
 _COMPASS_FULL = {"N": "North", "S": "South", "E": "East", "W": "West"}
 
 
+def _normalize_compass_side(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s in _OPPOSITE_SIDE:
+        return s
+    return _COMPASS_FULL.get(s[0].upper())
+
+
+def _segment_midpoint(line: list) -> tuple[float, float] | None:
+    if not line:
+        return None
+    mid = line[len(line) // 2]
+    if len(mid) < 2:
+        return None
+    return (mid[0], mid[1])
+
+
+def _side_from_sweeping_lines(
+    line: list,
+    street_sweeps: list[dict],
+    margin_m: float = SIDE_MARGIN_M,
+) -> str | None:
+    """Assign curb side by distance to side-labeled sweeping blockfaces."""
+    mid = _segment_midpoint(line)
+    if not mid:
+        return None
+    best_by_side: dict[str, float] = {}
+    for sb in street_sweeps:
+        side = _normalize_compass_side(sb.get("side"))
+        if not side:
+            continue
+        sweep_line = sb.get("line") or []
+        if len(sweep_line) < 2:
+            continue
+        d = _point_line_dist(mid, sweep_line)
+        prev = best_by_side.get(side)
+        if prev is None or d < prev:
+            best_by_side[side] = d
+    if not best_by_side:
+        return None
+    nearest_side = min(best_by_side, key=best_by_side.get)  # type: ignore[arg-type]
+    nearest_d = best_by_side[nearest_side]
+    opp = _OPPOSITE_SIDE.get(nearest_side)
+    opp_d = best_by_side.get(opp) if opp else None
+    if opp_d is not None:
+        return nearest_side if (opp_d - nearest_d) >= margin_m else None
+    # Only one compass axis present — accept when clearly nearer than others.
+    others = [d for s, d in best_by_side.items() if s != nearest_side]
+    if others and (min(others) - nearest_d) < margin_m:
+        return None
+    return nearest_side if nearest_d <= TIGHT_M else None
+
+
+def _side_from_parity_refs(
+    mid: tuple[float, float],
+    odd_c: tuple[float, float] | None,
+    even_c: tuple[float, float] | None,
+    parity_map: dict[str, str] | None,
+    margin_m: float = SIDE_MARGIN_M,
+) -> str | None:
+    if not parity_map or not odd_c or not even_c:
+        return None
+    d_odd = _meters(mid, odd_c)
+    d_even = _meters(mid, even_c)
+    if abs(d_odd - d_even) < margin_m:
+        return None
+    key = "o" if d_odd < d_even else "e"
+    return _normalize_compass_side(parity_map.get(key))
+
+
+def _side_from_meter_refs(
+    mid: tuple[float, float],
+    odd: tuple[float, float] | None,
+    even: tuple[float, float] | None,
+    parity_map: dict[str, str] | None,
+    margin_m: float = SIDE_MARGIN_M,
+) -> str | None:
+    if not odd or not even:
+        return None
+    d_odd = _meters(mid, odd)
+    d_even = _meters(mid, even)
+    if abs(d_odd - d_even) < margin_m:
+        return None
+    if parity_map:
+        key = "o" if d_odd < d_even else "e"
+        return _normalize_compass_side(parity_map.get(key))
+    # Weak E–W heuristic when parity map is unavailable.
+    return "North" if d_odd < d_even else "South"
+
+
+def _side_for_segment(
+    line: list,
+    street_sweeps: list[dict],
+    parity_map: dict[str, str] | None = None,
+    odd_addr: tuple[float, float] | None = None,
+    even_addr: tuple[float, float] | None = None,
+    odd_meter: tuple[float, float] | None = None,
+    even_meter: tuple[float, float] | None = None,
+) -> str | None:
+    """Deterministic curb-side for a Digital Curb segment. Never guesses."""
+    side = _side_from_sweeping_lines(line, street_sweeps)
+    if side:
+        return side
+    mid = _segment_midpoint(line)
+    if not mid:
+        return None
+    side = _side_from_parity_refs(mid, odd_addr, even_addr, parity_map)
+    if side:
+        return side
+    return _side_from_meter_refs(mid, odd_meter, even_meter, parity_map)
+
+
 def _derive_parity_map(
     geocoder: Geocoder | None,
     street_name: str,
@@ -395,30 +514,46 @@ def _merge_weekday_morning_np(
     """Merge per-day morning np segments into a Mon–Fri commuter window.
 
     Digital Curb often encodes Bush-style commuter lanes as Tue 7–8, Wed 6–7,
-    etc. instead of one Mon–Fri row.
+    etc. instead of one Mon–Fri row. Only coalesce rows that share the same
+    curb side (or are all unlabeled).
     """
     singles = [
         (sched, g) for sched, g in groups.items()
         if len(sched[0]) == 1 and sched[1] is not None and sched[2] is not None
         and sched[1] < 660 and sched[2] <= 660
     ]
-    weekdays_present = {sched[0][0] for sched, _ in singles if sched[0][0] < 5}
-    if len(weekdays_present) < 3:
-        return groups
+    by_side: dict[str | None, list[tuple[tuple, dict]]] = defaultdict(list)
+    for sched, g in singles:
+        side = sched[3] if len(sched) > 3 else g.get("side")
+        by_side[side].append((sched, g))
 
-    f = min(g["f"] for _, g in singles)
-    t = max(g["t"] for _, g in singles)
-    total_len = sum(g["seg_len"] for _, g in singles)
-    min_dist = min(g["dist"] for _, g in singles)
-    max_n = max(g.get("n", 0) for _, g in singles)
-    merged_key = (tuple(range(5)), f, t)
-    merged = {
-        "f": f, "t": t, "seg_len": total_len, "dist": min_dist,
-        "n": max_n, "d": list(range(5)),
-    }
-    # Drop the single-day rows absorbed into Mon–Fri.
-    out = {k: v for k, v in groups.items() if len(k[0]) != 1 or k[0][0] not in weekdays_present}
-    out[merged_key] = merged
+    out = dict(groups)
+    for side, side_singles in by_side.items():
+        weekdays_present = {sched[0][0] for sched, _ in side_singles if sched[0][0] < 5}
+        if len(weekdays_present) < 3:
+            continue
+        f = min(g["f"] for _, g in side_singles)
+        t = max(g["t"] for _, g in side_singles)
+        total_len = sum(g["seg_len"] for _, g in side_singles)
+        min_dist = min(g["dist"] for _, g in side_singles)
+        max_n = max(g.get("n", 0) for _, g in side_singles)
+        merged_key = (tuple(range(5)), f, t, side)
+        merged = {
+            "f": f, "t": t, "seg_len": total_len, "dist": min_dist,
+            "n": max_n, "d": list(range(5)), "side": side,
+        }
+        # Drop single-day morning rows for this side absorbed into Mon–Fri.
+        out = {
+            k: v for k, v in out.items()
+            if not (
+                len(k[0]) == 1
+                and k[0][0] in weekdays_present
+                and (k[3] if len(k) > 3 else None) == side
+                and k[1] is not None and k[1] < 660
+                and k[2] is not None and k[2] <= 660
+            )
+        }
+        out[merged_key] = merged
     return out
 
 
@@ -437,21 +572,6 @@ def _meter_side_refs(meters: list[dict]) -> tuple[tuple[float, float] | None, tu
     return odd, even
 
 
-def _infer_side_from_meters(
-    mid: tuple[float, float],
-    odd: tuple[float, float] | None,
-    even: tuple[float, float] | None,
-) -> str | None:
-    """Odd/even meter rows approximate north/south blockfaces on E–W streets."""
-    if not odd or not even:
-        return None
-    d_odd = _meters(mid, odd)
-    d_even = _meters(mid, even)
-    if abs(d_odd - d_even) < 8:
-        return None
-    return "North" if d_odd < d_even else "South"
-
-
 def _collect_aggregated_np(
     cell_zones: list[dict],
     name: str,
@@ -459,8 +579,18 @@ def _collect_aggregated_np(
     primary_refs: list[tuple[float, float]],
     corridor_refs: list[tuple[float, float]],
     street_sweeps: list[dict],
+    parity_map: dict[str, str] | None = None,
+    odd_addr: tuple[float, float] | None = None,
+    even_addr: tuple[float, float] | None = None,
+    odd_meter: tuple[float, float] | None = None,
+    even_meter: tuple[float, float] | None = None,
+    side_stats: dict[str, int] | None = None,
 ) -> dict[tuple, dict]:
-    """Group no-parking curb segments into schedule buckets for one street."""
+    """Group no-parking curb segments into schedule buckets for one street.
+
+    Bucket key is ``(days, from, to, side)`` so North 3–7pm and South 3–6pm
+    stay distinct instead of collapsing into one block-wide window.
+    """
     groups: dict[tuple, dict] = {}
     sweep_windows = [
         {"day": s["day"], "from": s["from"], "to": s["to"]} for s in street_sweeps
@@ -489,11 +619,22 @@ def _collect_aggregated_np(
             if f >= 660 and _min_dist_to_refs(line, primary_refs) > TIGHT_M:
                 continue
             seg_len = _segment_length(line)
-            key = (days, f, t)
-            mid = line[len(line) // 2]
-            mid_pt = (mid[0], mid[1]) if len(mid) >= 2 else None
+            side = _side_for_segment(
+                line, street_sweeps,
+                parity_map=parity_map,
+                odd_addr=odd_addr, even_addr=even_addr,
+                odd_meter=odd_meter, even_meter=even_meter,
+            )
+            if side_stats is not None:
+                side_stats["segments"] = side_stats.get("segments", 0) + 1
+                if side:
+                    side_stats["sided"] = side_stats.get("sided", 0) + 1
+                else:
+                    side_stats["ambiguous"] = side_stats.get("ambiguous", 0) + 1
+            key = (days, f, t, side)
+            mid_pt = _segment_midpoint(line)
             bucket = groups.setdefault(key, {
-                "d": list(days), "f": f, "t": t,
+                "d": list(days), "f": f, "t": t, "side": side,
                 "seg_len": 0.0, "dist": dist, "mids": [],
             })
             bucket["seg_len"] += seg_len
@@ -506,7 +647,7 @@ def _collect_aggregated_np(
     # Drop short buckets that only mirror street-sweeping re-encodes.
     filtered: dict[tuple, dict] = {}
     for key, g in groups.items():
-        days, f, t = key
+        days, f, t = key[0], key[1], key[2]
         if (g["seg_len"] < MIN_AGGREGATE_NP_M
                 and _coincides_with_sweeping(list(days), f, t, sweep_windows)):
             continue
@@ -515,7 +656,10 @@ def _collect_aggregated_np(
 
 
 def _coalesce_weekday_morning_np(rules: list[dict]) -> list[dict]:
-    """Merge scattered weekday-morning tow-away rows into one Mon–Fri corridor."""
+    """Merge scattered weekday-morning tow-away rows into one Mon–Fri corridor.
+
+    Only coalesce rows that share the same curb side (or are all unlabeled).
+    """
     morning = [
         r for r in rules
         if r.get("k") == "np" and r.get("f") is not None and r.get("t") is not None
@@ -524,28 +668,58 @@ def _coalesce_weekday_morning_np(rules: list[dict]) -> list[dict]:
     if len(morning) < 2:
         return rules
 
-    weekdays = {d for r in morning for d in (r.get("d") or [])}
-    total_n = sum(r.get("n", 0) for r in morning)
-    if len(weekdays) < 3 and total_n < 20:
-        return rules
+    by_side: dict[str | None, list[dict]] = defaultdict(list)
+    for r in morning:
+        by_side[r.get("side")].append(r)
 
-    f = min(r["f"] for r in morning)
-    t = max(r["t"] for r in morning)
-    conf = "confirmed" if any(r.get("x") == "confirmed" for r in morning) else morning[0].get("x")
-    merged = {
-        **morning[0],
-        "d": list(range(5)),
-        "f": f,
-        "t": t,
-        "x": conf,
-        "n": max(r.get("n", 0) for r in morning),
-    }
-    rest = [r for r in rules if r not in morning]
-    return rest + [merged]
+    result = [r for r in rules if r not in morning]
+    for side, rows in by_side.items():
+        if len(rows) < 2:
+            result.extend(rows)
+            continue
+        weekdays = {d for r in rows for d in (r.get("d") or [])}
+        total_n = sum(r.get("n", 0) for r in rows)
+        if len(weekdays) < 3 and total_n < 20:
+            result.extend(rows)
+            continue
+        f = min(r["f"] for r in rows)
+        t = max(r["t"] for r in rows)
+        conf = "confirmed" if any(r.get("x") == "confirmed" for r in rows) else rows[0].get("x")
+        merged = {
+            **rows[0],
+            "d": list(range(5)),
+            "f": f,
+            "t": t,
+            "x": conf,
+            "n": max(r.get("n", 0) for r in rows),
+        }
+        if side:
+            merged["side"] = side
+        else:
+            merged.pop("side", None)
+        result.append(merged)
+    return result
+
+
+def _can_merge_np_windows(a: dict, b: dict) -> bool:
+    """True when a and b may collapse without inventing a wider tow end time."""
+    if tuple(a.get("d") or []) != tuple(b.get("d") or []):
+        return False
+    if a.get("side") != b.get("side"):
+        return False
+    af, at, bf, bt = a["f"], a["t"], b["f"], b["t"]
+    if af == bf and at == bt:
+        return True
+    # Same end time; earlier start is containment and does not widen the end.
+    if at == bt and af != bf:
+        return True
+    # Distinct end times are distinct signs — never take max(t), especially
+    # for afternoon commute tow-away (3–6 vs 3–7).
+    return False
 
 
 def _merge_np_windows(rules: list[dict]) -> list[dict]:
-    """Merge overlapping no-parking windows on the same day-set."""
+    """Merge compatible no-parking windows on the same day-set and side."""
     nps = [r for r in rules if r.get("k") == "np" and r.get("f") is not None and r.get("t") is not None]
     rest = [r for r in rules if r not in nps]
     merged: list[dict] = []
@@ -553,20 +727,21 @@ def _merge_np_windows(rules: list[dict]) -> list[dict]:
     for i, a in enumerate(nps):
         if i in used:
             continue
-        days = tuple(a.get("d") or [])
         f, t = a["f"], a["t"]
         conf = a.get("x")
         n = a.get("n", 0)
         for j, b in enumerate(nps):
             if j <= i or j in used:
                 continue
-            if tuple(b.get("d") or []) != days:
+            cand = {**a, "f": f, "t": t}
+            if not _can_merge_np_windows(cand, b):
                 continue
-            if b["f"] <= t + 60 and b["t"] >= f - 60:
-                f, t = min(f, b["f"]), max(t, b["t"])
-                conf = "confirmed" if "confirmed" in (conf, b.get("x")) else conf
-                n = max(n, b.get("n", 0))
-                used.add(j)
+            f = min(f, b["f"])
+            # End time is identical under _can_merge_np_windows.
+            t = t if t == b["t"] else min(t, b["t"])  # defensive; should be equal
+            conf = "confirmed" if "confirmed" in (conf, b.get("x")) else conf
+            n = max(n, b.get("n", 0))
+            used.add(j)
         used.add(i)
         merged.append({**a, "f": f, "t": t, "x": conf, "n": n})
     return rest + merged
@@ -666,6 +841,7 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
 
     cells_bound = streets_bound = 0
     citation_index = _build_citation_index(detail_shards or {})
+    np_side_stats: dict[str, int] = {"segments": 0, "sided": 0, "ambiguous": 0}
 
     for cell in risk.get("cells") or []:
         streets = cell.get("s") or []
@@ -717,7 +893,8 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
                 if d > TIGHT_M:
                     continue
                 street_sweeps.append(sb)
-                key = (sb["day"], sb["from"], sb["to"], sb.get("side"))
+                weeks = sb.get("weeks") or [1, 1, 1, 1, 1]
+                key = (sb["day"], sb["from"], sb["to"], sb.get("side"), tuple(weeks))
                 if key in sweep_seen:
                     continue
                 sweep_seen.add(key)
@@ -734,6 +911,8 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
                     "d": days, "f": sb["from"] * 60, "t": sb["to"] * 60,
                     "side": sb.get("side"), "x": conf,
                 }
+                if not all(w == 1 for w in weeks):
+                    entry["w"] = weeks
                 if corr >= CORROBORATION_MIN:
                     entry["n"] = corr
                 _apply_side_corroboration(
@@ -815,17 +994,25 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
                 bound.append(entry)
 
             # --- Digital Curb: aggregate tow-away corridors, then other rules ---
+            odd_meter, even_meter = _meter_side_refs(meters_by_street.get(name, []))
+            odd_addr = even_addr = None
+            if geocoder is not None and block_num:
+                odd_addr, even_addr = geocoder.block_parity_centroids(name, block_num)
             np_groups = _collect_aggregated_np(
-                cell_zones, name, geocodes, primary_refs, corridor_refs, street_sweeps)
+                cell_zones, name, geocodes, primary_refs, corridor_refs, street_sweeps,
+                parity_map=parity_map,
+                odd_addr=odd_addr, even_addr=even_addr,
+                odd_meter=odd_meter, even_meter=even_meter,
+                side_stats=np_side_stats,
+            )
             sweep_windows = [
                 {"day": sb["day"], "from": sb["from"], "to": sb["to"]}
                 for sb in street_sweeps
             ]
-            odd_ref, even_ref = _meter_side_refs(meters_by_street.get(name, []))
             has_afternoon_commute = any(
-                f >= 900 and t <= 20 * 60 for (_, f, t) in np_groups.keys()
+                f >= 900 and t <= 20 * 60 for (_, f, t, *_rest) in np_groups.keys()
             )
-            for (_days, f, t), agg in np_groups.items():
+            for (_days, f, t, side), agg in np_groups.items():
                 days = agg["d"]
                 # Morning no-parking rows that mostly mirror street sweeping are not tow-away.
                 if _should_drop_morning_np_as_sweep(
@@ -840,22 +1027,8 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
                 if not conf:
                     continue
                 entry = {"s": "curb", "k": "np", "d": days, "x": conf, "f": f, "t": t}
-                mids = agg.get("mids") or []
-                if mids:
-                    side = _infer_side_from_meters(mids[len(mids) // 2], odd_ref, even_ref)
-                    if side:
-                        entry["side"] = side
-                if f >= 900 and not entry.get("side"):
-                    north_days = {
-                        sb["day"] for sb in street_sweeps
-                        if (sb.get("side") or "").startswith("N")
-                    }
-                    south_days = {
-                        sb["day"] for sb in street_sweeps
-                        if (sb.get("side") or "").startswith("S")
-                    }
-                    if south_days and len(north_days) > len(south_days):
-                        entry["side"] = "South"
+                if side:
+                    entry["side"] = side
                 if corr >= CORROBORATION_MIN:
                     entry["n"] = corr
                 _apply_side_corroboration(
@@ -901,7 +1074,12 @@ def bind_street_rules(risk: dict, regulations: dict, sweeping: dict,
             if street["rules"]:
                 streets_bound += 1
 
+    segs = np_side_stats.get("segments", 0)
+    amb = np_side_stats.get("ambiguous", 0)
+    sided = np_side_stats.get("sided", 0)
+    pct = (100.0 * amb / segs) if segs else 0.0
     log(f"  bound rules on {streets_bound:,} street entries across {cells_bound:,} cells")
+    log(f"  np side assignment: {sided:,}/{segs:,} sided, {amb:,} ambiguous ({pct:.1f}%)")
     return risk
 
 
@@ -997,9 +1175,9 @@ def validate_known_blocks(risk: dict) -> list[str]:
     return errors
 
 
-_BLOCK_VALIDATION_CELL = "37789_-97936"
 _BLOCK_SIDE_VALIDATION = {
-    ("PINE ST", 1400): {
+    # 1400 Pine: South-only afternoon tow-away; meters on North.
+    ("37789_-97936", "PINE ST", 1400): {
         "require_kinds": {"rpp", "meter", "np", "sweep"},
         "require_np_side": "South",
         "require_meter_side": "North",
@@ -1008,22 +1186,37 @@ _BLOCK_SIDE_VALIDATION = {
         "south_sweep_weekdays": {3},
         "forbid_np_side": "North",
     },
+    # 900 Pine: South 3–6pm vs North 3–7pm (Street View / Digital Curb).
+    ("37790_-97930", "PINE ST", 900): {
+        "require_parity": {"e": "N", "o": "S"},
+        "require_np_hours_by_side": {
+            "South": (900, 1080),  # 15:00–18:00
+            "North": (900, 1140),  # 15:00–19:00
+        },
+        "forbid_unsided_afternoon_np": True,
+    },
 }
 
 
 def validate_block_side_rules(risk: dict) -> list[str]:
-    """Side-specific assertions for known asymmetric blocks (e.g. 1400 Pine)."""
+    """Side-specific assertions for known asymmetric blocks (e.g. 900/1400 Pine)."""
     errors: list[str] = []
-    cell = next((c for c in risk.get("cells") or [] if c.get("k") == _BLOCK_VALIDATION_CELL), None)
-    if not cell:
-        return [f"block validation cell {_BLOCK_VALIDATION_CELL} not found"]
+    cells_by_key = {c.get("k"): c for c in (risk.get("cells") or []) if c.get("k")}
 
-    for street in cell.get("s") or []:
-        name = street["n"]
-        block = street["b"]
-        spec = _BLOCK_SIDE_VALIDATION.get((name, block))
-        if not spec:
+    for (cell_key, name, block), spec in _BLOCK_SIDE_VALIDATION.items():
+        cell = cells_by_key.get(cell_key)
+        if not cell:
+            errors.append(f"block validation cell {cell_key} not found")
             continue
+        street = next(
+            (s for s in (cell.get("s") or [])
+             if s.get("n") == name and s.get("b") == block),
+            None,
+        )
+        if not street:
+            errors.append(f"{name} {block}: street not found in cell {cell_key}")
+            continue
+
         rules = street.get("rules") or []
         kinds = {r.get("k") for r in rules}
         for req in spec.get("require_kinds") or set():
@@ -1049,9 +1242,29 @@ def validate_block_side_rules(risk: dict) -> list[str]:
                 errors.append(
                     f"{name} {block}: parity {key} expected {compass}, got {parity.get(key)}")
 
+        for side, (rf, rt) in (spec.get("require_np_hours_by_side") or {}).items():
+            hit = next(
+                (r for r in rules
+                 if r.get("k") == "np" and r.get("side") == side
+                 and r.get("f") == rf and r.get("t") == rt),
+                None,
+            )
+            if not hit:
+                errors.append(
+                    f"{name} {block}: missing {side} tow-away {rf // 60}-{rt // 60}h "
+                    f"(got {[ (r.get('side'), r.get('f'), r.get('t')) for r in rules if r.get('k') == 'np' ]})")
+
+        if spec.get("forbid_unsided_afternoon_np"):
+            unsided = [
+                r for r in rules
+                if r.get("k") == "np" and not r.get("side") and (r.get("f") or 0) >= 900
+            ]
+            if unsided:
+                errors.append(f"{name} {block}: unexpected unsided afternoon tow-away")
+
         np_south = next(
             (r for r in rules if r.get("k") == "np" and r.get("side") == "South"), None)
-        if np_south and parity:
+        if np_south and parity and spec.get("require_np_side") == "South":
             side_n = np_south.get("n") or 0
             if side_n < 2:
                 errors.append(f"{name} {block}: South tow-away under-corroborated (n={side_n})")
@@ -1074,3 +1287,37 @@ def validate_block_side_rules(risk: dict) -> list[str]:
                 errors.append(f"{name} {block}: South sweep missing weekday {day}")
 
     return errors
+
+
+def report_afternoon_np_splits(old_risk: dict, new_risk: dict) -> list[str]:
+    """Blocks where a single unsided afternoon np window split into distinct ends."""
+    def afternoon_np(street: dict) -> list[tuple]:
+        out = []
+        for r in street.get("rules") or []:
+            if r.get("k") != "np":
+                continue
+            f, t = r.get("f"), r.get("t")
+            if f is None or t is None or f < 900:
+                continue
+            out.append((r.get("side"), f, t))
+        return out
+
+    old_by: dict[tuple, list[tuple]] = {}
+    for cell in old_risk.get("cells") or []:
+        for street in cell.get("s") or []:
+            old_by[(cell.get("k"), street.get("n"), street.get("b"))] = afternoon_np(street)
+
+    lines: list[str] = []
+    for cell in new_risk.get("cells") or []:
+        for street in cell.get("s") or []:
+            key = (cell.get("k"), street.get("n"), street.get("b"))
+            old = old_by.get(key) or []
+            new = afternoon_np(street)
+            old_ends = {t for _, _, t in old}
+            new_ends = {t for _, _, t in new}
+            old_unsided = any(s is None for s, _, _ in old)
+            if old_unsided and len(old_ends) <= 1 and len(new_ends) >= 2:
+                lines.append(
+                    f"{street.get('n')} {street.get('b')} ({cell.get('k')}): "
+                    f"{old} -> {new}")
+    return lines

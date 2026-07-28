@@ -28,7 +28,7 @@ def main() -> int:
         for err in block_errors:
             print(f"FAIL: {err}")
         return 1
-    print("OK: validation passed (900 Pine / 1400 Pine / 800 Taylor / 800 Bush)")
+    print("OK: validation passed (900 Pine N 3–7 / S 3–6, 1400 Pine, Taylor, Bush)")
     return 0
 
 
