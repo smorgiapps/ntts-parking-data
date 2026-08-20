@@ -20,8 +20,16 @@ from collections import defaultdict
 
 import requests
 
-QUERY_URL = ("https://services.sfmta.com/arcgis/rest/services/Parking/"
-             "digitalcurb/MapServer/0/query")
+PUBLISHED_CURB_API = (
+    "https://api.github.com/repos/smorgiapps/ntts-parking-data/contents/curb"
+    "?ref=gh-pages"
+)
+QUERY_URLS = (
+    "https://services.sfmta.com/arcgis/rest/services/Parking/"
+    "digitalcurb/MapServer/0/query",
+    "https://services.sfmta.com/arcgis/rest/services/Parking/"
+    "digitalcurb/FeatureServer/0/query",
+)
 PAGE = 2_000  # server maxRecordCount
 CACHE_MAX_AGE_DAYS = 7
 
@@ -33,61 +41,133 @@ _KEEP_ATTRS = ("CURB_ZONE_ID", "RULES_ACTIVITY", "RULES_MAX_STAY",
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
-def _fetch_pages(cache_path: str, log) -> list[dict]:
-    """Fetch all relevant curb policy rows (GeoJSON features), with a local cache."""
-    if os.path.exists(cache_path):
-        age_days = (time.time() - os.path.getmtime(cache_path)) / 86_400
-        if age_days < CACHE_MAX_AGE_DAYS:
-            with gzip.open(cache_path, "rt") as f:
-                return [json.loads(line) for line in f]
+def _load_cache(cache_path: str) -> list[dict] | None:
+    if not os.path.exists(cache_path):
+        return None
+    with gzip.open(cache_path, "rt") as f:
+        rows = [json.loads(line) for line in f]
+    return rows or None
 
+
+def _cache_age_days(cache_path: str) -> float:
+    return (time.time() - os.path.getmtime(cache_path)) / 86_400
+
+
+def _download_pages(log) -> list[dict]:
+    """Fetch all relevant curb policy rows from the first live SFMTA endpoint."""
     where = "IS_ACTIVE='Y' AND (RULES_ACTIVITY='no parking' OR RULES_MAX_STAY>0)"
-    features: list[dict] = []
-    offset = 0
+    last_error: Exception | None = None
     session = requests.Session()
-    while True:
-        # NB: this MapServer is picky - it rejects f=geojson AND any named
-        # outFields list; only outFields=* works. Trim attrs after download.
-        params = {
-            "where": where,
-            "outFields": "*",
-            "outSR": 4326,
-            "geometryPrecision": 5,
-            "f": "json",
-            "resultOffset": offset,
-            "resultRecordCount": PAGE,
-        }
-        for attempt in range(5):
-            try:
-                resp = session.get(QUERY_URL, params=params, timeout=300)
-                resp.raise_for_status()
-                payload = resp.json()
-                if "error" in payload:
-                    raise ValueError(str(payload["error"]))
-                break
-            except (requests.RequestException, ValueError):
-                if attempt == 4:
-                    raise
-                time.sleep(2 ** attempt * 3)
-        page = payload.get("features", [])
-        # Keep only the attributes we use before caching (outFields=* is big).
-        for feat in page:
-            attrs = feat.get("attributes") or {}
-            feat["attributes"] = {k: attrs.get(k) for k in _KEEP_ATTRS}
-        features.extend(page)
-        if offset % 20_000 == 0:
-            log(f"  curb: fetched {len(features):,} rows")
-        if len(page) < PAGE and not payload.get("exceededTransferLimit", False):
-            break
-        offset += len(page)
-    if not features:
-        raise RuntimeError("digital curb query returned no rows - check query params")
-    log(f"  curb: fetched {len(features):,} rows total")
+    for query_url in QUERY_URLS:
+        features: list[dict] = []
+        offset = 0
+        try:
+            while True:
+                # NB: this MapServer is picky - it rejects f=geojson AND any named
+                # outFields list; only outFields=* works. Trim attrs after download.
+                params = {
+                    "where": where,
+                    "outFields": "*",
+                    "outSR": 4326,
+                    "geometryPrecision": 5,
+                    "f": "json",
+                    "resultOffset": offset,
+                    "resultRecordCount": PAGE,
+                }
+                payload = None
+                for attempt in range(5):
+                    try:
+                        resp = session.get(query_url, params=params, timeout=300)
+                        resp.raise_for_status()
+                        payload = resp.json()
+                        if "error" in payload:
+                            raise ValueError(str(payload["error"]))
+                        break
+                    except ValueError as exc:
+                        # ArcGIS 404s will not recover on retry.
+                        if "404" in str(exc) or attempt == 4:
+                            raise
+                        time.sleep(2 ** attempt * 3)
+                    except requests.RequestException:
+                        if attempt == 4:
+                            raise
+                        time.sleep(2 ** attempt * 3)
+                page = (payload or {}).get("features", [])
+                for feat in page:
+                    attrs = feat.get("attributes") or {}
+                    feat["attributes"] = {k: attrs.get(k) for k in _KEEP_ATTRS}
+                features.extend(page)
+                if offset % 20_000 == 0:
+                    log(f"  curb: fetched {len(features):,} rows")
+                if len(page) < PAGE and not (payload or {}).get("exceededTransferLimit", False):
+                    break
+                offset += len(page)
+            if not features:
+                raise RuntimeError(f"digital curb query returned no rows ({query_url})")
+            log(f"  curb: fetched {len(features):,} rows total from {query_url}")
+            return features
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last_error = exc
+            log(f"  curb: {query_url} unavailable ({exc})")
+            continue
+    raise last_error or RuntimeError("digital curb query failed")
+
+
+def _fetch_pages(cache_path: str, log) -> list[dict]:
+    """Fetch curb rows, preferring a fresh cache and falling back to a stale one."""
+    cached = _load_cache(cache_path)
+    if cached is not None and _cache_age_days(cache_path) < CACHE_MAX_AGE_DAYS:
+        return cached
+
+    try:
+        features = _download_pages(log)
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        if cached:
+            log(f"  curb: live fetch failed ({exc}); "
+                f"using cached snapshot ({_cache_age_days(cache_path):.0f}d old)")
+            return cached
+        raise
 
     with gzip.open(cache_path, "wt") as f:
         for feat in features:
             f.write(json.dumps(feat) + "\n")
     return features
+
+
+def load_shard_dir(path: str) -> dict[str, dict]:
+    shards: dict[str, dict] = {}
+    if not os.path.isdir(path):
+        return shards
+    for fname in os.listdir(path):
+        if not fname.endswith(".json"):
+            continue
+        with open(os.path.join(path, fname)) as f:
+            shards[fname[:-5]] = json.load(f)
+    return shards
+
+
+def fetch_published_shards(log) -> dict[str, dict]:
+    """Last successful gh-pages curb shards, for when ArcGIS is gone."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = requests.get(PUBLISHED_CURB_API, headers=headers, timeout=60)
+    resp.raise_for_status()
+    listing = resp.json()
+    if not isinstance(listing, list):
+        raise RuntimeError(f"unexpected GitHub API response for published curb: {listing}")
+    shards: dict[str, dict] = {}
+    for item in listing:
+        name = item.get("name") or ""
+        url = item.get("download_url")
+        if not name.endswith(".json") or not url:
+            continue
+        file_resp = requests.get(url, timeout=60)
+        file_resp.raise_for_status()
+        shards[name[:-5]] = file_resp.json()
+    log(f"  curb: downloaded {len(shards):,} published shards from gh-pages")
+    return shards
 
 
 def _parse_days(raw) -> list[int]:
@@ -134,7 +214,25 @@ def _max_stay_minutes(attrs) -> int | None:
 
 def build_curb_shards(cache_dir: str, lat_step: float, lon_step: float,
                       tile_factor: int, log) -> dict[str, dict]:
-    features = _fetch_pages(os.path.join(cache_dir, "curb.jsonl.gz"), log)
+    cache_path = os.path.join(cache_dir, "curb.jsonl.gz")
+    fallback_dir = os.environ.get(
+        "CURB_FALLBACK_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(cache_dir)), "fallback", "curb"),
+    )
+    try:
+        features = _fetch_pages(cache_path, log)
+    except (requests.RequestException, ValueError, RuntimeError, OSError) as exc:
+        shards = load_shard_dir(fallback_dir)
+        if not shards:
+            try:
+                shards = fetch_published_shards(log)
+            except (requests.RequestException, ValueError, RuntimeError) as published_exc:
+                log(f"  curb: published-shard fallback failed ({published_exc})")
+        if shards:
+            log(f"  curb: live/cache unavailable ({exc}); "
+                f"using {len(shards):,} last-published shards")
+            return shards
+        raise
     log(f"  curb: {len(features):,} policy rows")
 
     zones: dict[str, dict] = {}

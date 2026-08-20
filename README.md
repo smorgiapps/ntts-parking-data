@@ -8,7 +8,10 @@ public DataSF datasets:
   geocoded against the Enterprise Addressing System (`ramy-di5m`)
 - **Street Sweeping Schedule** (`yhqp-riqs`)
 - **Parking Meters** (`8vzz-qzz9`) + **Meter Operating Schedules** (`6cqg-dxku`)
-- **SFMTA Digital Curb** — posted tow-away, time-limit, and RPP rules
+- **SFMTA Digital Curb** — posted tow-away / time-limit rules. SFMTA
+  unpublished the ArcGIS `Parking/digitalcurb` service in July 2026; the
+  daily job falls back to the last cached/published curb shards until a
+  replacement feed is available.
 
 A GitHub Actions workflow runs `pipeline/run_pipeline.py` daily and publishes
 the **v6 bundle** to the `gh-pages` branch, served via GitHub Pages.
