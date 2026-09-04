@@ -37,3 +37,8 @@ of a block.
 
 Historical enforcement patterns are educational only. Always follow posted
 signs — absence of past tickets is not permission to park illegally.
+
+## Weekly block risk (schema v9)
+
+Monday CI (`weekly-block-risk.yml`) refreshes `block_risk.json` on `gh-pages` and
+bumps `manifest.schemaVersion` to 9. This repo is the pipeline source of truth.
