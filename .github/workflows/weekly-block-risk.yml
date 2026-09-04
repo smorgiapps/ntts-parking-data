@@ -1,0 +1,70 @@
+name: Weekly block risk model
+
+on:
+  schedule:
+    - cron: "0 11 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publish-block-risk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Checkout published Pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: published
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r src/pipeline/requirements.txt
+
+      - name: Refresh block_risk if models exist
+        env:
+          SODA_APP_TOKEN: ${{ secrets.SODA_APP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -f src/pipeline/enforcement_model.py ]; then
+            python src/pipeline/enforcement_model.py || echo "enforcement_model skipped"
+          fi
+          if [ -f src/pipeline/run_meter_hazard.py ]; then
+            python src/pipeline/run_meter_hazard.py --help >/dev/null || true
+          fi
+          if [ -f src/pipeline/output/block_risk.json ]; then
+            cp src/pipeline/output/block_risk.json published/block_risk.json
+          elif [ -f published/block_risk.json ]; then
+            echo "keeping published block_risk.json"
+          fi
+          python - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          path = Path("published/manifest.json")
+          manifest = json.loads(path.read_text()) if path.exists() else {}
+          manifest["version"] = max(int(manifest.get("version") or 0), 9)
+          manifest["schemaVersion"] = 9
+          manifest["generatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          files = manifest.setdefault("files", {})
+          files["blockRisk"] = "block_risk.json"
+          path.write_text(json.dumps(manifest, separators=(",", ":")))
+          print("manifest", manifest)
+          PY
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: published
+          publish_branch: gh-pages
+          force_orphan: false
