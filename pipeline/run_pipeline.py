@@ -93,11 +93,18 @@ def fetch_citations(months: int, now: datetime, use_cache: bool) -> list[dict]:
         else:
             where = (f"citation_issued_datetime >= '{start.isoformat()}' AND "
                      f"citation_issued_datetime < '{end.isoformat()}'")
-            month_rows = list(soda.fetch_all(soda.CITATIONS, select=fields, where=where))
-            if stable:
+            try:
+                month_rows = list(soda.fetch_all(soda.CITATIONS, select=fields, where=where))
                 with gzip.open(cache_file, "wt") as f:
                     for r in month_rows:
                         f.write(json.dumps(r) + "\n")
+            except Exception as exc:
+                if use_cache and os.path.exists(cache_file):
+                    log(f"  {tag}: live fetch failed ({exc}); using cached snapshot")
+                    with gzip.open(cache_file, "rt") as f:
+                        month_rows = [json.loads(line) for line in f]
+                else:
+                    raise
         log(f"  {tag}: {len(month_rows):,} citations")
         rows.extend(month_rows)
     return rows

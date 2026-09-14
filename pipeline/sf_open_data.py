@@ -5,9 +5,10 @@ import time
 
 import requests
 
-BASE = "https://data.sfgov.org/resource"
+# data.sfgov.org started returning nginx 403 (or UA-gated 301s) in Sept 2026.
+BASE = "https://data.sf.gov/resource"
 
-# Dataset IDs on data.sfgov.org
+# Dataset IDs on data.sf.gov
 CITATIONS = "ab4h-6ztd"        # SFMTA Parking Citations & Fines
 ADDRESSES = "ramy-di5m"        # Addresses - Enterprise Addressing System
 SWEEPING = "yhqp-riqs"         # Street Sweeping Schedule
@@ -17,6 +18,7 @@ REGULATIONS = "hi6h-neyh"      # Parking regulations (except non-metered color c
 
 PAGE_SIZE = 50_000
 MAX_RETRIES = 5
+USER_AGENT = "NoTimeToSpeed/2.2 (+https://github.com/smorgiapps/ntts-parking-data)"
 
 
 def _session() -> requests.Session:
@@ -25,6 +27,7 @@ def _session() -> requests.Session:
     if token:
         s.headers["X-App-Token"] = token
     s.headers["Accept"] = "application/json"
+    s.headers["User-Agent"] = USER_AGENT
     return s
 
 
@@ -52,7 +55,7 @@ def _get(session: requests.Session, url: str, params: dict) -> list:
             resp = session.get(url, params=params, timeout=180)
             if resp.status_code == 200:
                 return resp.json()
-            if resp.status_code in (429, 500, 502, 503):
+            if resp.status_code in (403, 429, 500, 502, 503):
                 time.sleep(2 ** attempt * 2)
                 continue
             resp.raise_for_status()
