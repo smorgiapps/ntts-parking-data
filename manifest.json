@@ -1,0 +1,1 @@
+{"version":6,"generatedAt":"2026-11-06T17:30:16","dataThrough":"2026-11-02T19:49:00","sources":["parking_sfmta"],"files":{"riskGrid":"risk_grid.json","sweeping":"sweeping.json","meters":"meters.json","regulations":"regulations.json","detailsDir":"details","curbDir":"curb","violationIndex":"violation_index.json","insights":"insights.json"}}
